@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 is the floor the README claims; 3.13 is current stable. worm-lab
+        # has no version-gated stdlib imports, so every check runs everywhere
+        # and the floors below are the same on every cell.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.11", "3.13"]
+        exclude:
+          - { os: macos-latest, python: "3.9" }
+          - { os: macos-latest, python: "3.11" }
+          - { os: windows-latest, python: "3.9" }
+          - { os: windows-latest, python: "3.11" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Every step below declares `shell: bash`. The default shell on
+      # windows-latest is PowerShell, where `tee`, `grep` and `$n` do not
+      # exist -- so an undeclared POSIX step does not fail loudly on Windows,
+      # it fails in a way that looks like the tool is broken. Git Bash is
+      # present on the Windows runners and setup-python's PATH reaches it.
+
+      - name: Confirm the tool has no third-party imports
+        shell: bash
+        run: python ci/import_gate.py
+
+      - name: Selftest
+        # The count comes from the suite's own report line. This is what keeps
+        # a check that quietly stopped asserting anything from sailing past.
+        shell: bash
+        run: |
+          set -euo pipefail
+          python worm-lab.py selftest | tee selftest.log
+          ran=$(grep -c "^  ok   " selftest.log || true)
+          echo "checks: $ran run"
+          if [ "$ran" -lt 21 ]; then
+            echo "::error::selftest ran only $ran checks, expected at least 21"
+            exit 1
+          fi
+
+      - name: Selftest can actually fail
+        # Breaks the tool on purpose and requires the suites to notice. Without
+        # this, a selftest that had stopped asserting anything would sail past
+        # the count check above and make the whole job theatre.
+        shell: bash
+        run: python ci/prove_suites_can_fail.py
+
+      - name: End-to-end
+        # The count comes from unittest's own `Ran N tests`, not from counting
+        # `... ok` lines: with verbosity=2 a failing test's name line and the
+        # count line are the only stable surface.
+        shell: bash
+        run: |
+          set -uo pipefail
+          python tests/test_worm_lab.py 2>&1 | tee e2e.log
+          status=${PIPESTATUS[0]}
+          n=$(sed -nE 's/^Ran ([0-9]+) tests?.*/\1/p' e2e.log | head -1)
+          n=${n:-0}
+          echo "tests: $n"
+          if [ "$n" -lt 23 ]; then
+            echo "::error::only $n tests ran, expected at least 23"
+            exit 1
+          fi
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the end-to-end suite reported failures (exit $status)"
+            exit "$status"
+          fi
+
+      - name: Mutation sweep (one cell only)
+        # Ten real mutants plus a provably-identical canary, run against a
+        # scratch copy; every real mutant must be killed and the canary must
+        # survive, or the run is void. ~2 minutes, so only one cell runs it.
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
+        shell: bash
+        run: python ci/mutation.py
