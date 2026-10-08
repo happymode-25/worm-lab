@@ -1,0 +1,12 @@
+# Normalise line endings in the repository; check out LF everywhere.
+#
+# The audit trail hashes the canonical bytes of a record and the mutation and
+# prove-suites harnesses match multi-line anchors, so a CRLF/LF flip would
+# change behaviour between machines. Keeping the tree LF-only means the tool
+# and its harnesses behave identically on Windows and Linux.
+* text=auto eol=lf
+
+*.py   text diff=python
+*.md   text
+*.yml  text
+*.txt  text
